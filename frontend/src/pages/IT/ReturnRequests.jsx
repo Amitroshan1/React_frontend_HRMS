@@ -10,6 +10,7 @@ import {
   rejectReturnRequestAPI
 } from "./Data";
 import { openFirstImageInNewTab, openImageInNewTab } from "../../utils/openImageInNewTab";
+import { isImageSrc } from "../../utils/mediaSrc";
 import "./ReturnRequests.css";
 import { formatDateTimeDDMMYYYY } from "../../utils/dateFormat";
 import { useTransitionRemark } from "./itam/TransitionRemarkModal";
@@ -166,7 +167,7 @@ export default function ReturnRequests() {
                           type="button"
                           className="rr-files-btn"
                           onClick={() => {
-                            const images = photos.filter((p) => String(p).startsWith("data:image/"));
+                            const images = photos.filter(isImageSrc);
                             if (images.length && openFirstImageInNewTab(images)) return;
                             const first = photos[0];
                             if (first) openImageInNewTab(first);

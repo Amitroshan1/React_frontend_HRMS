@@ -88,6 +88,8 @@ function ModalPhotoGrid({ photos, label }) {
               src={src}
               alt={`photo-${i + 1}`}
               className="pcl-parcel-photo-thumb pcl-photo-gallery-img"
+              loading="lazy"
+              decoding="async"
             />
           </button>
         ))}
@@ -131,6 +133,8 @@ function PhotoGalleryModal({ photos, title, onClose }) {
                   src={src}
                   alt={`Parcel photo ${i + 1}`}
                   className="pcl-parcel-photo-thumb pcl-photo-gallery-img"
+                  loading="lazy"
+                  decoding="async"
                 />
               </button>
             ))}

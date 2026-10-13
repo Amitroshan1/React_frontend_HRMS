@@ -8,7 +8,7 @@ OPEN_STATUSES = frozenset(
 TERMINAL_STATUSES = frozenset({"rejected", "cancelled", "returned"})
 
 # V1 hardware types (IT Assets catalog).
-DEFAULT_HW_TYPES = ("Laptop", "Mobile", "Desktop", "Tablet")
+DEFAULT_HW_TYPES = ("Laptop", "Mobile", "Desktop", "Tablet", "Dashcam", "ODCP")
 
 ALLOWED_TRANSITIONS = {
     "requested": frozenset({"approved", "rejected", "cancelled"}),

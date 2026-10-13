@@ -28,7 +28,10 @@ from .email import (
     send_it_return_request_status_email,
 )
 from .noc_department_service import download_noc_document, list_noc_requests, upload_noc_document
-from .employee_photo import photo_url_for_admin
+from .employee_photo import photo_url_for_admin, photo_urls_for_admin_ids
+from .it_media import media_in, media_out
+from .list_query import apply_search, keyset_page, opt_in_page_args, search_term
+from sqlalchemy.orm import selectinload
 
 
 it_bp = Blueprint("it", __name__)
@@ -212,8 +215,9 @@ def _admin_name(admin):
     return (admin.first_name or "").strip() or admin.email or f"Admin-{admin.id}"
 
 
-def _serialize_admin_employee(admin, assigned_assets=None):
-    photo = photo_url_for_admin(admin)
+def _serialize_admin_employee(admin, assigned_assets=None, photo=None):
+    if photo is None:
+        photo = photo_url_for_admin(admin)
     return {
         "id": admin.emp_id or str(admin.id),
         "empId": admin.emp_id or str(admin.id),
@@ -335,10 +339,10 @@ def _serialize_inventory_item(item):
         "category": item.category,
         "inventory_category": _effective_inventory_category(item),
         "hw_type": item.hw_type,
-        "photos": item.photos_json or [],
+        "photos": media_out(item.photos_json or []),
         "vendor": item.vendor or "",
         "purchase_date": item.purchase_date.isoformat() if item.purchase_date else None,
-        "receipts": item.receipts_json or [],
+        "receipts": media_out(item.receipts_json or []),
         "location": item.location or "",
         "notes": item.notes or "",
         "totalQuantity": int(item.total_quantity or 0),
@@ -351,7 +355,56 @@ def _serialize_inventory_item(item):
     }
 
 
-def _serialize_asset_unit(unit):
+def _photo_for(admin, ctx):
+    """Assignee photo URL; uses the batch map from a list context when available."""
+    if not admin:
+        return ""
+    photos = (ctx or {}).get("photos")
+    if photos is not None and admin.id in photos:
+        return photos[admin.id]
+    return photo_url_for_admin(admin)
+
+
+def _unit_list_load_options():
+    """Eager-load relations read by _serialize_asset_unit (avoids one query per unit)."""
+    from flask import has_app_context
+    from .itam.lifecycle_service import lifecycle_enabled
+
+    opts = [selectinload(ITAssetUnit.assigned_to_admin)]
+    if has_app_context() and lifecycle_enabled(current_app.config):
+        # Lifecycle fallback reads inventory_item.inventory_category; skip heavy photo/receipt JSON.
+        opts.append(
+            selectinload(ITAssetUnit.inventory_item).load_only(
+                ITInventoryItem.id, ITInventoryItem.inventory_category
+            )
+        )
+    return opts
+
+
+def _units_list_ctx(units):
+    """Batch lookups for serializing many units (photos + open deployments) in a few queries."""
+    from flask import has_app_context
+    from .itam.lifecycle_service import lifecycle_enabled, open_deploy_unit_ids
+
+    ctx = {
+        "photos": photo_urls_for_admin_ids(
+            {u.assigned_to_admin_id for u in units if u.assigned_to_admin_id}
+        )
+    }
+    if has_app_context() and lifecycle_enabled(current_app.config):
+        ctx["deployed"] = open_deploy_unit_ids(
+            [
+                u.id
+                for u in units
+                if not getattr(u, "lifecycle_status", None)
+                and (u.status or "").lower() == "assigned"
+                and not u.assigned_to_admin_id
+            ]
+        )
+    return ctx
+
+
+def _serialize_asset_unit(unit, ctx=None):
     from flask import current_app, has_app_context
     from .itam.lifecycle_service import lifecycle_enabled, serialize_lifecycle_fields
 
@@ -376,23 +429,25 @@ def _serialize_asset_unit(unit):
         "assignedTo": unit.assigned_to_admin_id,
         "assignedToName": _admin_name(unit.assigned_to_admin),
         "assignedToEmpId": (assigned_admin.emp_id if assigned_admin else None),
-        "assignedToPhoto": photo_url_for_admin(assigned_admin),
+        "assignedToPhoto": _photo_for(assigned_admin, ctx),
         "assignedDate": _iso(unit.assigned_at),
         "assetTag": unit.asset_tag,
         "exportedTo": unit.exported_to,
         "exportedAt": _iso(unit.exported_at),
         "repairDate": _iso(unit.repair_date),
-        "photos": unit.photos_json or [],
-        "assignmentPhotos": unit.assignment_photos_json or [],
+        "photos": media_out(unit.photos_json or []),
+        "assignmentPhotos": media_out(unit.assignment_photos_json or []),
         "created_at": _iso(unit.created_at),
         "updated_at": _iso(unit.updated_at),
     }
     if has_app_context() and lifecycle_enabled(current_app.config):
-        payload.update(serialize_lifecycle_fields(unit))
+        payload.update(
+            serialize_lifecycle_fields(unit, deployed_unit_ids=(ctx or {}).get("deployed"))
+        )
     return payload
 
 
-def _serialize_license(lic):
+def _serialize_license(lic, ctx=None):
     assigned_admin = lic.assigned_to_admin
     return {
         "id": lic.id,
@@ -405,7 +460,7 @@ def _serialize_license(lic):
         "assignedTo": lic.assigned_to_admin_id,
         "assignedToName": _admin_name(lic.assigned_to_admin),
         "assignedToEmpId": (assigned_admin.emp_id if assigned_admin else None),
-        "assignedToPhoto": photo_url_for_admin(assigned_admin),
+        "assignedToPhoto": _photo_for(assigned_admin, ctx),
         "assignedDate": _iso(lic.assigned_at),
         "created_at": _iso(lic.created_at),
         "updated_at": _iso(lic.updated_at),
@@ -443,7 +498,7 @@ def _serialize_removed_asset(r):
         "name": r.name,
         "category": r.category,
         "reason": r.reason,
-        "photos": r.photos_json or [],
+        "photos": media_out(r.photos_json or []),
         "removedAt": _iso(r.removed_at),
     }
 
@@ -475,7 +530,7 @@ def _serialize_parcel_import(i):
         "receivedByAdminId": i.received_by_admin_id,
         "receivedBy": (i.received_by_name or "").strip() or _admin_name(i.received_by_admin),
         "date": _iso(i.received_at),
-        "photos": i.photos_json or [],
+        "photos": media_out(i.photos_json or []),
     }
 
 
@@ -488,7 +543,7 @@ def _serialize_parcel_export(e):
         "exportedByAdminId": e.exported_by_admin_id,
         "exportedBy": (e.exported_by_name or "").strip() or _admin_name(e.exported_by_admin),
         "date": _iso(e.exported_at),
-        "photos": e.parcel_photos_json or [],
+        "photos": media_out(e.parcel_photos_json or []),
         "inventoryCategory": (e.inventory_category or "").strip() or None,
         "count": len(e.items),
         "assets": [
@@ -501,9 +556,11 @@ def _serialize_parcel_export(e):
                 "make": (it.make or "").strip()
                 or ((it.asset_unit.make or "").strip() if it.asset_unit else ""),
                 "model": it.model,
-                "individualPhoto": (it.individual_photo_json or [None])[0]
-                if isinstance(it.individual_photo_json, list)
-                else it.individual_photo_json,
+                "individualPhoto": media_out(
+                    (it.individual_photo_json or [None])[0]
+                    if isinstance(it.individual_photo_json, list)
+                    else it.individual_photo_json
+                ),
             }
             for it in e.items
         ],
@@ -526,7 +583,7 @@ def _serialize_return_request(r):
         "category": r.category,
         "reason": r.reason,
         "returnDestination": r.return_destination or "available",
-        "photos": r.photos_json or [],
+        "photos": media_out(r.photos_json or []),
         "status": r.status,
         "approvedByAdminId": r.approved_by_admin_id,
         "approvedByName": _admin_name(r.approved_by_admin),
@@ -602,6 +659,10 @@ def _serialize_emp_assets(emp):
         .filter(ITInventoryQuantityAssignment.quantity > 0)
         .all()
     )
+    return _emp_assets_payload(units, licenses, qty_rows)
+
+
+def _emp_assets_payload(units, licenses, qty_rows):
     assets = []
     for u in units:
         assets.append(
@@ -619,7 +680,7 @@ def _serialize_emp_assets(emp):
                 "serialNumber": u.serial_number or "",
                 "imei1": u.imei1,
                 "imei2": u.imei2,
-                "photos": u.assignment_photos_json or u.photos_json or [],
+                "photos": media_out(u.assignment_photos_json or u.photos_json or []),
                 "assignedDate": _iso(u.assigned_at),
             }
         )
@@ -664,13 +725,46 @@ def _serialize_emp_assets(emp):
 @it_bp.route("/employees/assigned-assets", methods=["GET"])
 @jwt_required()
 def list_employee_assigned_assets():
-    rows = Admin.query.order_by(Admin.id.asc()).all()
+    # Fixed number of queries regardless of employee count (was ~3 per employee).
+    units = (
+        ITAssetUnit.query.filter(ITAssetUnit.assigned_to_admin_id.isnot(None))
+        .order_by(ITAssetUnit.id.asc())
+        .all()
+    )
+    licenses = (
+        ITSoftwareLicense.query.filter(ITSoftwareLicense.assigned_to_admin_id.isnot(None))
+        .order_by(ITSoftwareLicense.id.asc())
+        .all()
+    )
+    qty_rows = (
+        ITInventoryQuantityAssignment.query.options(
+            selectinload(ITInventoryQuantityAssignment.inventory_item).load_only(
+                ITInventoryItem.id, ITInventoryItem.name, ITInventoryItem.category
+            )
+        )
+        .filter(ITInventoryQuantityAssignment.quantity > 0)
+        .order_by(ITInventoryQuantityAssignment.id.asc())
+        .all()
+    )
+
+    by_admin = {}
+    for u in units:
+        by_admin.setdefault(u.assigned_to_admin_id, ([], [], []))[0].append(u)
+    for s in licenses:
+        by_admin.setdefault(s.assigned_to_admin_id, ([], [], []))[1].append(s)
+    for qa in qty_rows:
+        by_admin.setdefault(qa.assigned_to_admin_id, ([], [], []))[2].append(qa)
+    if not by_admin:
+        return _ok({"employees": []})
+
+    admins = Admin.query.filter(Admin.id.in_(list(by_admin))).order_by(Admin.id.asc()).all()
+    photos = photo_urls_for_admin_ids([a.id for a in admins])
     out = []
-    for emp in rows:
-        assets = _serialize_emp_assets(emp)
+    for emp in admins:
+        assets = _emp_assets_payload(*by_admin[emp.id])
         if not assets:
             continue
-        out.append(_serialize_admin_employee(emp, assets))
+        out.append(_serialize_admin_employee(emp, assets, photo=photos.get(emp.id, "")))
     return _ok({"employees": out})
 
 
@@ -703,6 +797,17 @@ def it_summary():
     open_tickets = db.session.query(db.func.count(ITSupportTicket.id)).filter(ITSupportTicket.status == "pending").scalar() or 0
     assigned_assets = db.session.query(db.func.count(ITAssetUnit.id)).filter(ITAssetUnit.status == "assigned").scalar() or 0
     available_software = db.session.query(db.func.count(ITSoftwareLicense.id)).filter(ITSoftwareLicense.status == "available").scalar() or 0
+
+    def _grouped(col, id_col):
+        rows = db.session.query(col, db.func.count(id_col)).group_by(col).all()
+        return {str(k or "unknown").lower(): int(v or 0) for k, v in rows}
+
+    pending_returns = (
+        db.session.query(db.func.count(ITAssetReturnRequest.id))
+        .filter(db.func.lower(ITAssetReturnRequest.status) == "pending")
+        .scalar()
+        or 0
+    )
     return _ok(
         {
             "summary": {
@@ -710,6 +815,11 @@ def it_summary():
                 "open_tickets": open_tickets,
                 "assigned_assets": assigned_assets,
                 "available_software": available_software,
+                # Count-only breakdowns for dashboards (no row download needed).
+                "units_by_status": _grouped(ITAssetUnit.status, ITAssetUnit.id),
+                "licenses_by_status": _grouped(ITSoftwareLicense.status, ITSoftwareLicense.id),
+                "inventory_items_by_category": _grouped(ITInventoryItem.category, ITInventoryItem.id),
+                "pending_return_requests": int(pending_returns),
             }
         }
     )
@@ -811,8 +921,39 @@ def list_inventory_items():
         q = q.filter(db.func.lower(ITInventoryItem.category) == category.lower())
     if inventory_category:
         q = q.filter(db.func.lower(ITInventoryItem.inventory_category) == inventory_category.lower())
-    items = q.order_by(ITInventoryItem.id.desc()).all()
-    return _ok({"items": [_serialize_inventory_item(i) for i in items]})
+
+    limit, cursor = opt_in_page_args()
+    if limit is None:
+        items = q.order_by(ITInventoryItem.id.desc()).all()
+        return _ok({"items": [_serialize_inventory_item(i) for i in items]})
+
+    q = apply_search(
+        q,
+        [
+            ITInventoryItem.name,
+            ITInventoryItem.inventory_code,
+            ITInventoryItem.vendor,
+            ITInventoryItem.location,
+            ITInventoryItem.hw_type,
+        ],
+        search_term(),
+    )
+    items, next_cursor, has_more = keyset_page(q, ITInventoryItem.id, limit=limit, cursor=cursor)
+    return _ok(
+        {
+            "items": [_serialize_inventory_item(i) for i in items],
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
+    )
+
+
+@it_bp.route("/inventory/overview", methods=["GET"])
+@jwt_required()
+def inventory_overview():
+    from .it_inventory_overview import overview_payload
+
+    return _ok(overview_payload(_serialize_inventory_item))
 
 
 @it_bp.route("/inventory/items", methods=["POST"])
@@ -856,10 +997,10 @@ def create_inventory_item():
         category=category,
         inventory_category=inventory_category,
         hw_type=(data.get("hw_type") or None),
-        photos_json=data.get("photos") or [],
+        photos_json=media_in(data.get("photos") or [], "inventory"),
         vendor=(data.get("vendor") or "").strip() or None,
         purchase_date=_parse_date(data.get("purchase_date")),
-        receipts_json=data.get("receipts") or [],
+        receipts_json=media_in(data.get("receipts") or [], "receipt"),
         location=(data.get("location") or "").strip() or None,
         notes=notes,
         total_quantity=initial_quantity if is_qty_managed else 0,
@@ -910,7 +1051,12 @@ def update_inventory_item(item_id):
         ("receipts", "receipts_json"),
     ):
         if key in data:
-            setattr(item, attr, (data.get(key) or None))
+            value = data.get(key) or None
+            if key == "photos":
+                value = media_in(value, "inventory")
+            elif key == "receipts":
+                value = media_in(value, "receipt")
+            setattr(item, attr, value)
     if "purchase_date" in data:
         item.purchase_date = _parse_date(data.get("purchase_date"))
 
@@ -943,8 +1089,31 @@ def list_units():
         q = q.filter(db.func.lower(ITAssetUnit.status) == status.lower())
     if inventory_id:
         q = q.filter(ITAssetUnit.inventory_item_id == inventory_id)
-    rows = q.order_by(ITAssetUnit.id.desc()).all()
-    payload = [_serialize_asset_unit(r) for r in rows]
+    q = q.options(*_unit_list_load_options())
+
+    limit, cursor = opt_in_page_args()
+    page_meta = None
+    if limit is None:
+        rows = q.order_by(ITAssetUnit.id.desc()).all()
+    else:
+        q = apply_search(
+            q,
+            [
+                ITAssetUnit.unit_code,
+                ITAssetUnit.serial_number,
+                ITAssetUnit.asset_name,
+                ITAssetUnit.asset_tag,
+                ITAssetUnit.brand,
+                ITAssetUnit.model,
+                ITAssetUnit.imei1,
+                ITAssetUnit.imei2,
+            ],
+            search_term(),
+        )
+        rows, next_cursor, has_more = keyset_page(q, ITAssetUnit.id, limit=limit, cursor=cursor)
+        page_meta = {"next_cursor": next_cursor, "has_more": has_more}
+    ctx = _units_list_ctx(rows)
+    payload = [_serialize_asset_unit(r, ctx) for r in rows]
     if timeline_enabled(current_app.config) and payload:
         latest_map = latest_by_unit_ids([r.id for r in rows])
         for item in payload:
@@ -953,6 +1122,8 @@ def list_units():
                 item["lastTransition"] = latest
                 item["lastRemark"] = latest.get("remark")
                 item["lastTransitionAt"] = latest.get("occurredAt")
+    if page_meta is not None:
+        return _ok({"units": payload, **page_meta})
     return _ok({"units": payload})
 
 
@@ -1044,7 +1215,7 @@ def create_units_bulk():
             project_code=(row.get("project_code") or row.get("projectCode") or "").strip() or None,
             device_location=(row.get("device_location") or row.get("deviceLocation") or "").strip() or None,
             status=(row.get("status") or "available").strip(),
-            photos_json=row.get("photos") or [],
+            photos_json=media_in(row.get("photos") or [], "unit"),
         )
         unit_notes = (row.get("notes") or row.get("remark") or "").strip() or None
         if unit_notes and len(unit_notes) > 500:
@@ -1282,7 +1453,9 @@ def assign_unit():
     unit.assigned_to_admin_id = target_admin.id
     unit.assigned_at = _parse_dt(data.get("assigned_at")) or utc_now()
     unit.asset_tag = (data.get("asset_tag") or unit.asset_tag)
-    unit.assignment_photos_json = data.get("assignment_photos") or unit.assignment_photos_json or []
+    unit.assignment_photos_json = (
+        media_in(data.get("assignment_photos"), "assignment") or unit.assignment_photos_json or []
+    )
 
     err = _apply_lifecycle_or_err(
         unit,
@@ -1428,8 +1601,17 @@ def list_software_licenses():
         q = q.filter(db.func.lower(ITSoftwareLicense.name) == name.lower())
     if status:
         q = q.filter(db.func.lower(ITSoftwareLicense.status) == status.lower())
-    rows = q.order_by(ITSoftwareLicense.id.desc()).all()
-    return _ok({"licenses": [_serialize_license(r) for r in rows]})
+    rows = (
+        q.options(selectinload(ITSoftwareLicense.assigned_to_admin))
+        .order_by(ITSoftwareLicense.id.desc())
+        .all()
+    )
+    ctx = {
+        "photos": photo_urls_for_admin_ids(
+            {r.assigned_to_admin_id for r in rows if r.assigned_to_admin_id}
+        )
+    }
+    return _ok({"licenses": [_serialize_license(r, ctx) for r in rows]})
 
 
 @it_bp.route("/software/licenses/bulk", methods=["POST"])
@@ -1714,7 +1896,7 @@ def create_return_request():
         category=category,
         reason=reason,
         return_destination=return_destination,
-        photos_json=photos if isinstance(photos, list) else [],
+        photos_json=media_in(photos, "return_request") if isinstance(photos, list) else [],
         status="pending",
     )
     db.session.add(req)
@@ -1754,6 +1936,11 @@ def list_return_requests():
         q = q.filter(ITAssetReturnRequest.requester_admin_id == emp.id)
     elif only_mine and actor:
         q = q.filter(ITAssetReturnRequest.requester_admin_id == actor.id)
+    q = q.options(
+        selectinload(ITAssetReturnRequest.requester_admin),
+        selectinload(ITAssetReturnRequest.approved_by_admin),
+        selectinload(ITAssetReturnRequest.receipt_confirmed_by_admin),
+    )
     rows = q.order_by(ITAssetReturnRequest.created_at.desc(), ITAssetReturnRequest.id.desc()).all()
     return _ok({"requests": [_serialize_return_request(r) for r in rows]})
 
@@ -2437,6 +2624,10 @@ def list_tickets():
     q = ITSupportTicket.query
     if status:
         q = q.filter(db.func.lower(ITSupportTicket.status) == status.lower())
+    q = q.options(
+        selectinload(ITSupportTicket.requester_admin),
+        selectinload(ITSupportTicket.assignee_admin),
+    )
     rows = q.order_by(ITSupportTicket.created_at.desc(), ITSupportTicket.id.desc()).all()
     return _ok({"tickets": [_serialize_ticket(t) for t in rows]})
 
@@ -2482,7 +2673,14 @@ def resolve_ticket(ticket_id):
 @it_bp.route("/removed-assets", methods=["GET"])
 @jwt_required()
 def list_removed_assets():
-    rows = ITRemovedAsset.query.order_by(ITRemovedAsset.removed_at.desc(), ITRemovedAsset.id.desc()).all()
+    rows = (
+        ITRemovedAsset.query.options(
+            selectinload(ITRemovedAsset.owner_admin),
+            selectinload(ITRemovedAsset.removed_by_admin),
+        )
+        .order_by(ITRemovedAsset.removed_at.desc(), ITRemovedAsset.id.desc())
+        .all()
+    )
     return _ok({"removed_assets": [_serialize_removed_asset(r) for r in rows]})
 
 
@@ -2502,7 +2700,7 @@ def create_removed_asset():
         name=name,
         category=data.get("category"),
         reason=data.get("reason"),
-        photos_json=data.get("photos") or [],
+        photos_json=media_in(data.get("photos") or [], "removed"),
         removed_at=_parse_dt(data.get("removed_at")) or utc_now(),
     )
     db.session.add(r)
@@ -2538,7 +2736,11 @@ def delete_removed_asset(removed_id):
 @it_bp.route("/deleted-logs", methods=["GET"])
 @jwt_required()
 def list_deleted_logs():
-    rows = ITDeletedAssetLog.query.order_by(ITDeletedAssetLog.deleted_at.desc(), ITDeletedAssetLog.id.desc()).all()
+    rows = (
+        ITDeletedAssetLog.query.options(selectinload(ITDeletedAssetLog.deleted_by_admin))
+        .order_by(ITDeletedAssetLog.deleted_at.desc(), ITDeletedAssetLog.id.desc())
+        .all()
+    )
     return _ok({"logs": [_serialize_deleted_log(d) for d in rows]})
 
 
@@ -2651,7 +2853,7 @@ def create_parcel_import():
         received_by_admin_id=data.get("received_by_admin_id"),
         received_by_name=received_by_name,
         received_at=_parse_dt(data.get("received_at") or data.get("date")) or utc_now(),
-        photos_json=data.get("photos") or [],
+        photos_json=media_in(data.get("photos") or [], "parcel_import"),
     )
     db.session.add(row)
     db.session.flush()
@@ -2736,7 +2938,7 @@ def create_parcel_export():
         exported_by_admin_id=_coerce_optional_int(data.get("exported_by_admin_id")),
         exported_by_name=exported_by_name,
         exported_at=_parse_dt(data.get("exported_at") or data.get("date")) or utc_now(),
-        parcel_photos_json=data.get("photos") or [],
+        parcel_photos_json=media_in(data.get("photos") or [], "parcel_export"),
         inventory_category=inventory_category,
     )
     db.session.add(row)
@@ -2759,7 +2961,9 @@ def create_parcel_export():
             brand=it.get("brand"),
             make=make_val,
             model=it.get("model"),
-            individual_photo_json=it.get("individual_photo") or it.get("individualPhoto"),
+            individual_photo_json=media_in(
+                it.get("individual_photo") or it.get("individualPhoto"), "parcel_item"
+            ),
         )
         if not export_item.asset_name:
             continue

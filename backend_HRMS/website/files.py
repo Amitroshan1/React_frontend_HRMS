@@ -1,5 +1,7 @@
 """Authenticated / signed file download API."""
 
+import time
+
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required, get_jwt
 
@@ -41,7 +43,14 @@ def serve_signed_file(relative_path):
     sig = request.args.get("sig")
     if not exp or not sig or not verify_signature(rel, exp, sig):
         return jsonify({"success": False, "message": "Invalid or expired file link"}), 401
-    return send_resolved_upload(rel)
+    response = send_resolved_upload(rel)
+    if rel.startswith("it_media/") and getattr(response, "status_code", None) in (200, 304):
+        # IT media files are immutable (random name per upload): let the browser reuse them
+        # for as long as this signed URL is valid instead of re-downloading every page view.
+        max_age = max(0, min(int(exp) - int(time.time()), 86400))
+        response.headers["Cache-Control"] = f"private, max-age={max_age}, immutable"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @files_bp.route("/content/<path:relative_path>", methods=["GET"])

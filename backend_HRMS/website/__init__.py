@@ -155,6 +155,10 @@ def create_app():
     def after_request_cors(response):
         return _add_cors_headers(response)
 
+    from .http_perf import init_http_perf
+
+    init_http_perf(app)
+
     @app.errorhandler(500)
     def handle_500(e):
         response = jsonify(success=False, message="Internal server error")

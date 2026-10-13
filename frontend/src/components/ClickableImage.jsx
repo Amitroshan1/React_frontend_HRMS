@@ -29,6 +29,8 @@ export default function ClickableImage({
       alt={alt}
       className={["clickable-image", className].filter(Boolean).join(" ")}
       title={title}
+      loading="lazy"
+      decoding="async"
       role="button"
       tabIndex={0}
       onClick={handleActivate}

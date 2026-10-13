@@ -35,15 +35,34 @@ def _should_apply(config=None, require: Optional[bool] = None) -> bool:
     return bool(require)
 
 
+def open_deploy_unit_ids(unit_ids) -> set[int]:
+    """Unit ids that have an open (quantity > 0) location deployment — one query for a batch."""
+    ids = [int(i) for i in (unit_ids or []) if i]
+    if not ids:
+        return set()
+    rows = (
+        db.session.query(ITOfficeStockDeployment.asset_unit_id)
+        .filter(
+            ITOfficeStockDeployment.asset_unit_id.in_(ids),
+            ITOfficeStockDeployment.quantity > 0,
+        )
+        .distinct()
+        .all()
+    )
+    return {int(r[0]) for r in rows if r[0] is not None}
+
+
 def resolve_unit_lifecycle(
     unit: ITAssetUnit,
     *,
     inventory_category: Optional[str] = None,
+    deployed_unit_ids: Optional[set[int]] = None,
 ) -> tuple[str, str]:
     """
     Resolve (lifecycle_status, custody_type) for a unit.
 
     Prefer persisted P3 columns; else derive from legacy status + assignee / deploy.
+    ``deployed_unit_ids`` (from open_deploy_unit_ids) avoids a per-unit query in list views.
     """
     if getattr(unit, "lifecycle_status", None):
         life = unit.lifecycle_status
@@ -57,13 +76,16 @@ def resolve_unit_lifecycle(
     # Location deploy rows mark Deployed even when legacy status is "assigned".
     open_deploy = False
     if unit.id and (unit.status or "").lower() == "assigned" and not has_emp:
-        open_deploy = (
-            ITOfficeStockDeployment.query.filter(
-                ITOfficeStockDeployment.asset_unit_id == unit.id,
-                ITOfficeStockDeployment.quantity > 0,
-            ).first()
-            is not None
-        )
+        if deployed_unit_ids is not None:
+            open_deploy = int(unit.id) in deployed_unit_ids
+        else:
+            open_deploy = (
+                ITOfficeStockDeployment.query.filter(
+                    ITOfficeStockDeployment.asset_unit_id == unit.id,
+                    ITOfficeStockDeployment.quantity > 0,
+                ).first()
+                is not None
+            )
 
     life = canonical_status(
         unit.status,
@@ -83,8 +105,12 @@ def resolve_unit_lifecycle(
     return life, ctype
 
 
-def serialize_lifecycle_fields(unit: ITAssetUnit) -> dict[str, Any]:
-    life, ctype = resolve_unit_lifecycle(unit)
+def serialize_lifecycle_fields(
+    unit: ITAssetUnit,
+    *,
+    deployed_unit_ids: Optional[set[int]] = None,
+) -> dict[str, Any]:
+    life, ctype = resolve_unit_lifecycle(unit, deployed_unit_ids=deployed_unit_ids)
     custody = unit.custody_json if isinstance(getattr(unit, "custody_json", None), dict) else None
     if custody is None:
         custody = {"type": ctype}

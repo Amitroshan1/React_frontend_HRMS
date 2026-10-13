@@ -1,8 +1,11 @@
-import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef, useDeferredValue } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { useRefreshOnNavigate } from "../../../hooks/useRefreshOnNavigate";
+import { useIncrementalList } from "../../../hooks/useIncrementalList";
 import ClickableImage from "../../../components/ClickableImage";
+import ShowMoreRows from "../../../components/ShowMoreRows";
+import { buildUnitLookupIndex, lookupUnitsForAsset } from "../unitLookupIndex";
 import { UserAvatar } from "../../../components/UserAvatar";
 import { getUserPhotoUrl } from "../../../utils/userPhoto";
 import { formatDate as fmt } from "../../../utils/dateFormat";
@@ -26,6 +29,7 @@ import {
   saveInventoryToStorage,
   saveSoftwareInventory,
   syncITDataFromAPI,
+  IT_NAV_SYNC_MAX_AGE_MS,
   syncRemovedITFromAPI
 } from "../Data";
 import { useTransitionRemark } from "../itam/TransitionRemarkModal";
@@ -291,7 +295,18 @@ function formatAssignedToLabel(assignedTo) {
 }
 
 /** Lowercased concatenation of fields used by main table search (Available + Assigned). */
+const _searchBlobCache = new WeakMap();
+
 function assetSearchBlob(a) {
+  let blob = _searchBlobCache.get(a);
+  if (blob === undefined) {
+    blob = buildAssetSearchBlob(a);
+    _searchBlobCache.set(a, blob);
+  }
+  return blob;
+}
+
+function buildAssetSearchBlob(a) {
   const parts = [
     a.name,
     a.hwType,
@@ -327,31 +342,30 @@ function resolveImei(unit) {
   return imei2 || "";
 }
 
-function getAvailableUnitsForInventory(inventoryId, assetName, hwType) {
-  const all = getAssetUnitsFromStorage() || [];
-  const avail = all.filter(
-    (u) => String(u.status || "").toLowerCase() === "available",
-  );
-  const byId = avail.filter(
-    (u) => String(u.inventoryId) === String(inventoryId),
-  );
-  if (byId.length > 0) return byId;
-  if (hwType) {
-    const byNameAndType = avail.filter(
-      (u) =>
-        (u.assetName === assetName || u.name === assetName) &&
-        String(u.hwType || "").toLowerCase() === String(hwType).toLowerCase(),
-    );
-    if (byNameAndType.length > 0) return byNameAndType;
-  }
-  return avail.filter((u) => u.assetName === assetName || u.name === assetName);
+const isAvailableUnit = (u) => String(u.status || "").toLowerCase() === "available";
+const sameAvailableHwType = (u, hwType) =>
+  String(u.hwType || "").toLowerCase() === String(hwType).toLowerCase();
+
+function buildAvailableUnitIndex() {
+  return buildUnitLookupIndex(getAssetUnitsFromStorage() || [], isAvailableUnit);
 }
 
-function resolveAvailableIdentityFields(inventoryItem) {
+function getAvailableUnitsForInventory(inventoryId, assetName, hwType, index = null) {
+  return lookupUnitsForAsset(
+    index || buildAvailableUnitIndex(),
+    inventoryId,
+    assetName,
+    hwType,
+    sameAvailableHwType,
+  );
+}
+
+function resolveAvailableIdentityFields(inventoryItem, index = null) {
   const units = getAvailableUnitsForInventory(
     inventoryItem.id,
     inventoryItem.name,
     inventoryItem.hwType,
+    index,
   );
   let laptopCode = "";
   let imei = "";
@@ -590,6 +604,7 @@ function compareAssetRows(a, b, sortMode) {
 function buildAvailableData() {
   const inv = getInventoryFromStorage() || [];
   const seen = new Set();
+  const unitIndex = buildAvailableUnitIndex();
 
   return inv
     .filter((a) => {
@@ -601,7 +616,7 @@ function buildAvailableData() {
       return Number(a.availableQuantity) > 0;
     })
     .map((a) => {
-      const { laptopCode, imei } = resolveAvailableIdentityFields(a);
+      const { laptopCode, imei } = resolveAvailableIdentityFields(a, unitIndex);
       return {
         id: a.id,
         name: a.name || "",
@@ -622,8 +637,36 @@ function buildAvailableData() {
     });
 }
 
+/**
+ * Same result as `employees.find(x => empId match || adminId match)` — the first employee
+ * (in list order) matching either key — without scanning the list per unit.
+ */
+function buildEmployeeMatcher(employees) {
+  const byEmpId = new Map();
+  const byAdminId = new Map();
+  employees.forEach((x, i) => {
+    const xEmpId = String(x.id || x.empId || "").toUpperCase();
+    const xAdminId = String(x.adminId || x.id || "");
+    if (!byEmpId.has(xEmpId)) byEmpId.set(xEmpId, i);
+    if (!byAdminId.has(xAdminId)) byAdminId.set(xAdminId, i);
+  });
+  return (empId, adminId) => {
+    let best = -1;
+    if (empId !== "—") {
+      const i = byEmpId.get(String(empId).toUpperCase());
+      if (i != null) best = i;
+    }
+    if (adminId != null) {
+      const i = byAdminId.get(String(adminId));
+      if (i != null && (best < 0 || i < best)) best = i;
+    }
+    return best >= 0 ? employees[best] : undefined;
+  };
+}
+
 function buildAssignedData() {
   const employees = getEmployees() || [];
+  const findEmployee = buildEmployeeMatcher(employees);
 
   const resolveEmployee = (assignedTo) => {
     if (!assignedTo) return { empId: "—", empName: "—", empPhoto: "" };
@@ -643,13 +686,7 @@ function buildAssignedData() {
       if (/^\d+$/.test(empId)) adminId = empId;
     }
 
-    const match = employees.find((x) => {
-      const xEmpId = (x.id || x.empId || "").toUpperCase();
-      const xAdminId = String(x.adminId || x.id || "");
-      if (empId !== "—" && xEmpId === empId.toUpperCase()) return true;
-      if (adminId != null && xAdminId === String(adminId)) return true;
-      return false;
-    });
+    const match = findEmployee(empId, adminId);
     if (match) {
       empId = match.empId || match.id || empId;
       empName = match.name || empName;
@@ -2219,6 +2256,7 @@ export default function AssetsDashboard() {
   const [typeFilter, setTypeFilter] = useState("All");
   const [typeOptions, setTypeOptions] = useState([]);
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
   const [sortMode, setSortMode] = useState("name-asc");
   const [detailItem, setDetailItem] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -2226,7 +2264,7 @@ export default function AssetsDashboard() {
   const bumpRefreshKey = useCallback(() => setRefreshKey((k) => k + 1), []);
 
   const syncAssetsFromServer = useCallback(() => {
-    syncITDataFromAPI().then(bumpRefreshKey).catch((err) => {
+    syncITDataFromAPI({ maxAgeMs: IT_NAV_SYNC_MAX_AGE_MS }).then(bumpRefreshKey).catch((err) => {
       console.error("[AssetsDashboard] API sync failed, using cached data:", err);
       toastITApiFailure(
           err,
@@ -2286,7 +2324,7 @@ export default function AssetsDashboard() {
       );
     }
 
-    const tokens = search
+    const tokens = deferredSearch
       .trim()
       .toLowerCase()
       .split(/\s+/)
@@ -2305,7 +2343,18 @@ export default function AssetsDashboard() {
       return cmp;
     });
     return sorted;
-  }, [data, catFilter, typeFilter, search, sortMode]);
+  }, [data, catFilter, typeFilter, deferredSearch, sortMode]);
+
+  const tableRows = useIncrementalList(
+    filtered,
+    `${mainFilter}|${catFilter}|${typeFilter}|${deferredSearch}|${sortMode}`,
+  );
+
+  const countForCategory = useMemo(() => {
+    const byCategory = new Map();
+    for (const a of data) byCategory.set(a.category, (byCategory.get(a.category) || 0) + 1);
+    return (cat) => (cat === "ALL" ? data.length : byCategory.get(cat) || 0);
+  }, [data]);
 
   const categoryScopedData = useMemo(() => {
     if (catFilter === "ALL") return data;
@@ -2339,16 +2388,22 @@ export default function AssetsDashboard() {
 
   const totalAssetCount = useMemo(() => {
     if (mainFilter === "Available") {
-      const allUnits = getAssetUnitsFromStorage() || [];
+      // Per unit, count it once under each distinct key it matches (inventoryId / assetId),
+      // so countByKey[id] equals the old `units.filter(inventoryId === id || assetId === id).length`.
+      const countByKey = new Map();
+      for (const u of getAssetUnitsFromStorage() || []) {
+        const invKey = String(u.inventoryId);
+        const assetKey = String(u.assetId);
+        countByKey.set(invKey, (countByKey.get(invKey) || 0) + 1);
+        if (assetKey !== invKey) {
+          countByKey.set(assetKey, (countByKey.get(assetKey) || 0) + 1);
+        }
+      }
       return filtered.reduce((sum, a) => {
         if (a.category === "Software") {
           return sum + (a.totalQty || a.seats || a.availableQty || 0);
         }
-        const unitCount = allUnits.filter(
-          (u) =>
-            String(u.inventoryId) === String(a.id) ||
-            String(u.assetId) === String(a.id),
-        ).length;
+        const unitCount = countByKey.get(String(a.id)) || 0;
         return sum + (unitCount || a.availableQty || 0);
       }, 0);
     } else {
@@ -2482,11 +2537,7 @@ export default function AssetsDashboard() {
               onClick={() => setCatFilter(cat)}
             >
               {cat}
-              <span className="am-cat-count">
-                {cat === "ALL"
-                  ? data.length
-                  : data.filter((a) => a.category === cat).length}
-              </span>
+              <span className="am-cat-count">{countForCategory(cat)}</span>
             </button>
           ))}
         </div>
@@ -2562,7 +2613,7 @@ export default function AssetsDashboard() {
                       </td>
                     </tr>
                   ) : (
-                    filtered.map((a, i) => {
+                    tableRows.visible.map((a, i) => {
                       const cc = CAT_COLOR[a.category] || CAT_COLOR.Hardware;
                       const assignedQty = Number(a.assignedQty) || 0;
                       return (
@@ -2644,6 +2695,7 @@ export default function AssetsDashboard() {
                       );
                     })
                   )}
+                  <ShowMoreRows list={tableRows} colSpan={availableColSpan} />
                 </tbody>
               </table>
             ) : (
@@ -2665,7 +2717,7 @@ export default function AssetsDashboard() {
                       </td>
                     </tr>
                   ) : (
-                    filtered.map((a, i) => {
+                    tableRows.visible.map((a, i) => {
                       const cc = CAT_COLOR[a.category] || CAT_COLOR.Hardware;
                       return (
                         <tr
@@ -2714,6 +2766,7 @@ export default function AssetsDashboard() {
                       );
                     })
                   )}
+                  <ShowMoreRows list={tableRows} colSpan={5} />
                 </tbody>
               </table>
             )}

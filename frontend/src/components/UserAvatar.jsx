@@ -91,6 +91,8 @@ export function UserAvatar({
           src={src}
           alt=""
           className={imgClassName}
+          loading="lazy"
+          decoding="async"
           onError={() => setFailed(true)}
           style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 'inherit' }}
         />
@@ -103,6 +105,8 @@ export function UserAvatar({
       src={src}
       alt={alt ?? (displayName || 'User')}
       className={className || imgClassName}
+      loading="lazy"
+      decoding="async"
       onError={() => setFailed(true)}
     />
   );

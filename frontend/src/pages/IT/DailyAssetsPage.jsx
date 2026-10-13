@@ -322,7 +322,7 @@ export default function DailyAssetsPage() {
     );
   }
 
-  const types = me?.hw_types || ["Laptop", "Mobile", "Desktop", "Tablet"];
+  const types = me?.hw_types || ["Laptop", "Mobile", "Desktop", "Tablet", "Dashcam", "ODCP"];
   const openRequests =
     Array.isArray(me?.open_requests) && me.open_requests.length
       ? me.open_requests

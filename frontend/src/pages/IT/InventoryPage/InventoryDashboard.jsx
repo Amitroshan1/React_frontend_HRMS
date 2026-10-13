@@ -1,9 +1,12 @@
 // InventoryDashboard.jsx
-import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo, useDeferredValue } from "react";
 import { Routes, Route, Navigate, useNavigate, useLocation, useSearchParams } from "react-router-dom";
 import { toast } from "react-toastify";
 import ClickableImage from "../../../components/ClickableImage";
+import ShowMoreRows from "../../../components/ShowMoreRows";
 import { useRefreshOnNavigate } from "../../../hooks/useRefreshOnNavigate";
+import { useIncrementalList } from "../../../hooks/useIncrementalList";
+import { buildUnitLookupIndex, lookupUnitsForAsset } from "../unitLookupIndex";
 import { isAdminVisitActive } from "../../../hooks/useAdminVisitNav";
 import "./InventoryDashboard.css";
 import {
@@ -22,14 +25,17 @@ import {
   getInventoryCounts,
   toastITApiFailure,
   syncITDataFromAPI,
+  IT_NAV_SYNC_MAX_AGE_MS,
   syncDeletedLogsFromAPI,
   setUnitStatusAPI,
   createDeletedLogAPI,
   deleteAssetUnitAPI,
   updateInventoryItemAPI,
   getDeletedAssetsFromStorage,
-  getSoftwareInventory
+  getSoftwareInventory,
+  toLocalInventoryItem,
 } from "../Data";
+import { IT_SERVER_LISTS_ENABLED, useDebouncedValue, useITList } from "../useITList";
 import { useTransitionRemark } from "../itam/TransitionRemarkModal";
 import { actionCodeForStatusChange, remarkPayload } from "../itam/transitionUi";
 import AssetHistoryTimeline from "../itam/AssetHistoryTimeline";
@@ -95,6 +101,22 @@ const STATUS_FILTERS = [
   { id: "Available", label: "Available", chip: "available" },
   { id: "Assigned", label: "Assigned", chip: "assigned" },
 ];
+
+const OVERVIEW_PATH = "/inventory/overview";
+const SERVER_PAGE_SIZE = 50;
+const OVERVIEW_MORE_PARAMS = { counts: 0 };
+const NO_ROWS = [];
+
+/** Overview / Total Assets rows, filtered + counted + paged on the server (falls back to the cache on error). */
+function useInventoryOverviewList(params) {
+  const list = useITList(OVERVIEW_PATH, params, {
+    enabled: IT_SERVER_LISTS_ENABLED,
+    pageSize: SERVER_PAGE_SIZE,
+    moreParams: OVERVIEW_MORE_PARAMS,
+    mapItem: mapServerInventoryRow,
+  });
+  return { ...list, active: IT_SERVER_LISTS_ENABLED && !list.error };
+}
 
 const EDIT_OPTIONS = [
   { key: "repair",     label: "Repair",     icon: "🔧", color: "#d97706", hoverBg: "#fef3c7", bg: "#fffbeb", borderColor: "#d97706" },
@@ -272,10 +294,18 @@ function readLiveCounts(inventoryCategory = null) {
   };
 }
 
-function mapInventoryItem(item) {
+function mapInventoryItem(item, unitIndex = null) {
+  const units = getUnitsForAsset(item.id, item.name, item.hwType, unitIndex);
+  return mapInventoryRow(item, units[0]);
+}
+
+/** Row from /inventory/overview: the server sends the newest unit's brand/make/model as first_unit. */
+function mapServerInventoryRow(apiItem) {
+  return mapInventoryRow(toLocalInventoryItem(apiItem), apiItem?.first_unit || undefined);
+}
+
+function mapInventoryRow(item, firstUnit) {
   const inventoryCategory = resolveInventoryCategory(item);
-  const units = getUnitsForAsset(item.id, item.name, item.hwType);
-  const firstUnit = units[0];
   return {
     id:                item.id,
     name:              item.name,
@@ -303,31 +333,34 @@ function mapInventoryItem(item) {
 }
 
 function getMappedInventory(inventoryCategory = null) {
-  const items = readInventory().map(mapInventoryItem).filter((i) => !i.isSoftware);
+  const unitIndex = buildInventoryUnitIndex();
+  const items = readInventory()
+    .map((item) => mapInventoryItem(item, unitIndex))
+    .filter((i) => !i.isSoftware);
   return inventoryCategory
     ? filterInventoryByCategory(items, inventoryCategory)
     : items;
 }
 
-function getUnitsForAsset(inventoryId, assetName, hwType) {
-  const all = readUnits();
+const sameUnitHwType = (u, hwType) =>
+  String(u.hwType ?? "").toLowerCase() === String(hwType).toLowerCase();
 
-  // 1️⃣ Best match: by inventoryId (unique per brand+hwType combo)
-  const byId = all.filter((u) => String(u.inventoryId) === String(inventoryId));
-  if (byId.length > 0) return byId;
+function buildInventoryUnitIndex() {
+  return buildUnitLookupIndex(readUnits());
+}
 
-  // 2️⃣ Fallback for legacy data: match by name AND hwType so Apple Mobile ≠ Apple Laptop
-  if (hwType) {
-    const byNameAndType = all.filter(
-      (u) =>
-        (u.assetName === assetName || u.name === assetName) &&
-        (u.hwType ?? "").toLowerCase() === hwType.toLowerCase(),
-    );
-    if (byNameAndType.length > 0) return byNameAndType;
-  }
-
-  // 3️⃣ Last resort: name only (old data with no hwType stored on unit)
-  return all.filter((u) => u.assetName === assetName || u.name === assetName);
+/**
+ * Units for an inventory row: by inventoryId, else legacy name + hwType (so Apple Mobile ≠
+ * Apple Laptop), else name only. Pass a prebuilt `unitIndex` when looping over many rows.
+ */
+function getUnitsForAsset(inventoryId, assetName, hwType, unitIndex = null) {
+  return lookupUnitsForAsset(
+    unitIndex || buildInventoryUnitIndex(),
+    inventoryId,
+    assetName,
+    hwType,
+    sameUnitHwType,
+  );
 }
 
 function buildReviewTarget(row, preferredUnit = null) {
@@ -407,10 +440,10 @@ function buildCategoryQtyCounts(assets) {
   };
 }
 
-function assetMatchesProjectName(asset, projectName) {
+function assetMatchesProjectName(asset, projectName, unitIndex = null) {
   if (!projectName || projectName === "All") return true;
   const needle = projectName.trim().toLowerCase();
-  const units = getUnitsForAsset(asset.id, asset.name, asset.hwType);
+  const units = getUnitsForAsset(asset.id, asset.name, asset.hwType, unitIndex);
   return units.some((u) => {
     const code = (u.projectCode || u.project_code || "").trim().toLowerCase();
     const legacy = (u.make || "").trim().toLowerCase();
@@ -420,9 +453,10 @@ function assetMatchesProjectName(asset, projectName) {
 
 function collectProjectNamesFromAssets(assets) {
   const names = new Set();
+  const unitIndex = buildInventoryUnitIndex();
   assets.forEach((asset) => {
     if (!isMobileTabletHwType(asset.hwType)) return;
-    getUnitsForAsset(asset.id, asset.name, asset.hwType).forEach((unit) => {
+    getUnitsForAsset(asset.id, asset.name, asset.hwType, unitIndex).forEach((unit) => {
       const code = (unit.projectCode || unit.project_code || "").trim();
       if (code) {
         names.add(code);
@@ -443,6 +477,12 @@ function filterITOverviewAssets(assets, {
   statusFilter = "All",
 }) {
   const q = searchQuery.trim().toLowerCase();
+  const needsProjectMatch =
+    categoryFilter === "Hardware" &&
+    isMobileTabletHwType(hwSubFilter) &&
+    projectNameFilter &&
+    projectNameFilter !== "All";
+  const unitIndex = needsProjectMatch ? buildInventoryUnitIndex() : null;
   return assets
     .filter((a) => inventoryCategoryMatches(a.category, categoryFilter))
     .filter((a) => {
@@ -453,7 +493,7 @@ function filterITOverviewAssets(assets, {
     })
     .filter((a) => {
       if (categoryFilter !== "Hardware" || !isMobileTabletHwType(hwSubFilter)) return true;
-      return assetMatchesProjectName(a, projectNameFilter);
+      return assetMatchesProjectName(a, projectNameFilter, unitIndex);
     })
     .filter((a) => {
       if (!q) return true;
@@ -1775,7 +1815,7 @@ export function InventoryShell({ children, category, setCategory, activeSegment 
 
   const syncInventoryCounts = useCallback(() => {
     const update = () => setCounts(readLiveCounts(category));
-    syncITDataFromAPI().then(update).catch((err) => {
+    syncITDataFromAPI({ maxAgeMs: IT_NAV_SYNC_MAX_AGE_MS }).then(update).catch((err) => {
       console.error("[InventoryDashboard] API sync failed, using cached data:", err);
       toastITApiFailure(
           err,
@@ -2120,15 +2160,31 @@ function AssetTable({
   onOfficeIssue,
   onOfficeReturn,
   responsive = false,
+  resetKey = "",
+  serverList = null,
 }) {
   const showAvailable = filter !== "Assigned" && filter !== "In use";
   const showAssigned  = !hideAssigned && filter !== "Available";
-  const showLaptopCode = shouldShowLaptopCodeColumn(assets, inventoryCategory);
+  const showLaptopCode = serverList
+    ? Boolean(serverList.meta?.show_laptop_code)
+    : shouldShowLaptopCodeColumn(assets, inventoryCategory);
   const emptyColSpan  =
     5 +
     (showLaptopCode ? 1 : 0) +
     (showAvailable ? 1 : 0) +
     (showAssigned ? 1 : 0);
+  const localRows = useIncrementalList(assets, `${filter}|${resetKey}`);
+  const rows = serverList
+    ? {
+        visible: assets,
+        shown: assets.length,
+        total: serverList.total,
+        hasMore: serverList.hasMore,
+        showMore: serverList.loadMore,
+        loading: serverList.loadingMore,
+      }
+    : localRows;
+  const firstLoad = Boolean(serverList && !serverList.loaded && serverList.loading);
 
   return (
     <div className={`inv-table-scroll${responsive ? " inv-table-scroll--responsive" : ""}`}>
@@ -2148,10 +2204,12 @@ function AssetTable({
         <tbody>
           {assets.length === 0 ? (
             <tr>
-              <td colSpan={emptyColSpan} className="inv-empty-row">No assets found.</td>
+              <td colSpan={emptyColSpan} className="inv-empty-row">
+                {firstLoad ? "Loading assets…" : "No assets found."}
+              </td>
             </tr>
           ) : (
-            assets.map((row, i) => (
+            rows.visible.map((row, i) => (
               <tr key={row.id} className={i % 2 === 0 ? "tr-even" : "tr-odd"}>
                 {showLaptopCode && (
                   <td
@@ -2206,6 +2264,11 @@ function AssetTable({
               </tr>
             ))
           )}
+          <ShowMoreRows
+            list={rows}
+            colSpan={emptyColSpan}
+            pageSize={serverList ? SERVER_PAGE_SIZE : undefined}
+          />
         </tbody>
       </table>
     </div>
@@ -2324,7 +2387,22 @@ function TotalAssetsPage({ category }) {
   const inventoryDeploy = showInventoryDeploy(category);
   const assignedLabel = getAssignedColumnLabel(category);
 
-  const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const server = useInventoryOverviewList({
+    inventory_category: category,
+    category: categoryTypeFilter,
+    hw_type: subTypeFilter,
+    counts: 1,
+  });
+  const serverActive = server.active;
+  const reloadServer = server.reload;
+  const serverFailed = Boolean(server.error);
+
+  // Local cache refresh (modals/actions read it); the server list reloads only after saves.
+  const refreshLocal = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const refresh = useCallback(() => {
+    refreshLocal();
+    if (IT_SERVER_LISTS_ENABLED) reloadServer();
+  }, [refreshLocal, reloadServer]);
   const {
     removeTarget,
     setRemoveTarget,
@@ -2337,8 +2415,9 @@ function TotalAssetsPage({ category }) {
   } = useAssetActions(refresh);
 
   useRefreshOnNavigate(() => {
-    syncITDataFromAPI()
-      .then(() => refresh())
+    if (serverFailed) reloadServer();
+    syncITDataFromAPI({ maxAgeMs: IT_NAV_SYNC_MAX_AGE_MS })
+      .then(() => refreshLocal())
       .catch((err) => {
         console.error("[TotalAssetsPage] API sync failed, using cached data:", err);
         toastITApiFailure(
@@ -2346,7 +2425,7 @@ function TotalAssetsPage({ category }) {
             "Could not sync inventory from the server. Showing cached assets.",
             { toastId: "it-sync-fail" },
           );
-        refresh();
+        refreshLocal();
       });
   }, [category]);
 
@@ -2357,23 +2436,27 @@ function TotalAssetsPage({ category }) {
 
   const inventoryForCounts = useMemo(() => {
     void refreshKey;
+    if (serverActive) return NO_ROWS;
     return getMappedInventory(category).filter((a) => Number(a.total) > 0);
-  }, [category, refreshKey]);
+  }, [category, refreshKey, serverActive]);
 
+  const serverCounts = server.meta?.counts;
   const categoryCounts = useMemo(
-    () => buildCategoryQtyCounts(inventoryForCounts),
-    [inventoryForCounts],
+    () => (serverActive ? serverCounts?.category || {} : buildCategoryQtyCounts(inventoryForCounts)),
+    [serverActive, serverCounts, inventoryForCounts],
   );
 
   const subTypeCounts = useMemo(
-    () => buildHwTypeQtyCounts(inventoryForCounts, categoryTypeFilter),
-    [inventoryForCounts, categoryTypeFilter],
+    () =>
+      serverActive
+        ? serverCounts?.sub_type || {}
+        : buildHwTypeQtyCounts(inventoryForCounts, categoryTypeFilter),
+    [serverActive, serverCounts, inventoryForCounts, categoryTypeFilter],
   );
 
   const filteredAssets = useMemo(() => {
-    void refreshKey;
-    return getMappedInventory(category)
-      .filter((a) => Number(a.total) > 0)
+    if (serverActive) return server.items;
+    return inventoryForCounts
       .filter((a) => inventoryCategoryMatches(a.category, categoryTypeFilter))
       .filter((a) => {
         if (
@@ -2385,7 +2468,7 @@ function TotalAssetsPage({ category }) {
         }
         return true;
       });
-  }, [category, categoryTypeFilter, subTypeFilter, refreshKey]);
+  }, [serverActive, server.items, inventoryForCounts, categoryTypeFilter, subTypeFilter]);
 
   const filterBadgeParts = [
     categoryTypeFilter !== "All" ? categoryTypeFilter : null,
@@ -2399,7 +2482,7 @@ function TotalAssetsPage({ category }) {
       <InventoryPanel
         eyebrow={category}
         title="Total Assets"
-        recordCount={filteredAssets.length}
+        recordCount={serverActive ? server.total : filteredAssets.length}
         filterBadge={
           filterBadgeParts.length > 0 ? (
             <span className="inv-table-filter-badge">{filterBadgeParts.join(" · ")}</span>
@@ -2429,6 +2512,8 @@ function TotalAssetsPage({ category }) {
           onOfficeIssue={setOfficeIssueTarget}
           onOfficeReturn={setOfficeReturnTarget}
           responsive
+          resetKey={`${category}|${categoryTypeFilter}|${subTypeFilter}`}
+          serverList={serverActive ? server : null}
         />
       </InventoryPanel>
 
@@ -2490,6 +2575,7 @@ function OverviewPage({ category }) {
   const [hwSubFilter, setHwSubFilter] = useState("All");
   const [projectNameFilter, setProjectNameFilter] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
+  const deferredSearchQuery = useDeferredValue(searchQuery);
   const [detailAsset, setDetailAsset] = useState(null);
   const [reviewTarget, setReviewTarget] = useState(null);
   const [officeIssueTarget, setOfficeIssueTarget] = useState(null);
@@ -2499,7 +2585,27 @@ function OverviewPage({ category }) {
   const inventoryDeploy = showInventoryDeploy(category);
   const assignedLabel = getAssignedColumnLabel(category);
 
-  const refresh = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const debouncedSearchQuery = useDebouncedValue(searchQuery, 300);
+  const server = useInventoryOverviewList({
+    inventory_category: category,
+    category: showItFilters ? categoryFilter : "All",
+    hw_type: showItFilters ? hwSubFilter : "All",
+    project: showItFilters ? projectNameFilter : "All",
+    q: showItFilters ? debouncedSearchQuery.trim() : "",
+    status: statusFilter,
+    counts: 1,
+  });
+  const serverActive = server.active;
+  const reloadServer = server.reload;
+  const serverFailed = Boolean(server.error);
+  const serverCounts = server.meta?.counts;
+
+  // Local cache refresh (modals/actions read it); the server list reloads only after saves.
+  const refreshLocal = useCallback(() => setRefreshKey((k) => k + 1), []);
+  const refresh = useCallback(() => {
+    refreshLocal();
+    if (IT_SERVER_LISTS_ENABLED) reloadServer();
+  }, [refreshLocal, reloadServer]);
   const {
     removeTarget,
     setRemoveTarget,
@@ -2512,8 +2618,9 @@ function OverviewPage({ category }) {
   } = useAssetActions(refresh);
 
   useRefreshOnNavigate(() => {
-    syncITDataFromAPI()
-      .then(() => refresh())
+    if (serverFailed) reloadServer();
+    syncITDataFromAPI({ maxAgeMs: IT_NAV_SYNC_MAX_AGE_MS })
+      .then(() => refreshLocal())
       .catch((err) => {
         console.error("[OverviewPage] API sync failed, using cached data:", err);
         toastITApiFailure(
@@ -2521,28 +2628,36 @@ function OverviewPage({ category }) {
             "Could not sync inventory from the server. Showing cached overview.",
             { toastId: "it-sync-fail" },
           );
-        refresh();
+        refreshLocal();
       });
   }, [category]);
 
   const baseAssets = useMemo(() => {
     void refreshKey;
+    if (serverActive) return NO_ROWS;
     return getMappedInventory(category).filter((a) => Number(a.total) > 0);
-  }, [category, refreshKey]);
+  }, [category, refreshKey, serverActive]);
 
   const categoryCounts = useMemo(
-    () => buildCategoryQtyCounts(baseAssets),
-    [baseAssets],
+    () => (serverActive ? serverCounts?.category || {} : buildCategoryQtyCounts(baseAssets)),
+    [serverActive, serverCounts, baseAssets],
   );
 
   const subTypeCounts = useMemo(
-    () => buildHwTypeQtyCounts(baseAssets, categoryFilter),
-    [baseAssets, categoryFilter],
+    () =>
+      serverActive
+        ? serverCounts?.sub_type || {}
+        : buildHwTypeQtyCounts(baseAssets, categoryFilter),
+    [serverActive, serverCounts, baseAssets, categoryFilter],
   );
 
   const projectNameOptions = useMemo(() => {
     if (!showItFilters || categoryFilter !== "Hardware" || !isMobileTabletHwType(hwSubFilter)) {
       return ["All"];
+    }
+    if (serverActive) {
+      const names = [...(serverCounts?.project_options || [])];
+      return ["All", ...names.sort((a, b) => a.localeCompare(b))];
     }
     const hardwareMobile = baseAssets.filter(
       (a) =>
@@ -2550,31 +2665,35 @@ function OverviewPage({ category }) {
         assetMatchesHwSubFilter(a, hwSubFilter),
     );
     return collectProjectNamesFromAssets(hardwareMobile);
-  }, [baseAssets, showItFilters, categoryFilter, hwSubFilter]);
+  }, [baseAssets, showItFilters, categoryFilter, hwSubFilter, serverActive, serverCounts]);
 
+  // Server options only describe the current Hardware type once its first page has loaded.
+  const projectOptionsSettled = !serverActive || !server.loading;
   useEffect(() => {
-    if (!projectNameOptions.includes(projectNameFilter)) {
+    if (projectOptionsSettled && !projectNameOptions.includes(projectNameFilter)) {
       setProjectNameFilter("All");
     }
-  }, [projectNameOptions, projectNameFilter]);
+  }, [projectOptionsSettled, projectNameOptions, projectNameFilter]);
 
   const preStatusAssets = useMemo(() => {
+    if (serverActive) return NO_ROWS;
     if (!showItFilters) return baseAssets;
     return filterITOverviewAssets(baseAssets, {
       categoryFilter,
       hwSubFilter,
       projectNameFilter,
-      searchQuery,
+      searchQuery: deferredSearchQuery,
       statusFilter: "All",
     });
-  }, [baseAssets, showItFilters, categoryFilter, hwSubFilter, projectNameFilter, searchQuery]);
+  }, [serverActive, baseAssets, showItFilters, categoryFilter, hwSubFilter, projectNameFilter, deferredSearchQuery]);
 
   const statusCounts = useMemo(
-    () => buildStatusQtyCounts(preStatusAssets),
-    [preStatusAssets],
+    () => (serverActive ? serverCounts?.status || {} : buildStatusQtyCounts(preStatusAssets)),
+    [serverActive, serverCounts, preStatusAssets],
   );
 
   const assets = useMemo(() => {
+    if (serverActive) return server.items;
     if (!showItFilters) {
       if (statusFilter === "Available") {
         return baseAssets.filter((a) => Number(a.available) > 0);
@@ -2588,10 +2707,10 @@ function OverviewPage({ category }) {
       categoryFilter,
       hwSubFilter,
       projectNameFilter,
-      searchQuery,
+      searchQuery: deferredSearchQuery,
       statusFilter,
     });
-  }, [baseAssets, showItFilters, categoryFilter, hwSubFilter, projectNameFilter, searchQuery, statusFilter]);
+  }, [serverActive, server.items, baseAssets, showItFilters, categoryFilter, hwSubFilter, projectNameFilter, deferredSearchQuery, statusFilter]);
 
   const handleCategoryFilterChange = useCallback((next) => {
     setCategoryFilter(next);
@@ -2613,7 +2732,7 @@ function OverviewPage({ category }) {
       <InventoryPanel
         eyebrow={category}
         title="Asset Overview"
-        recordCount={assets.length}
+        recordCount={serverActive ? server.total : assets.length}
         filterBadge={
           showItFilters &&
           (categoryFilter !== "All" ||
@@ -2666,14 +2785,11 @@ function OverviewPage({ category }) {
                     onChange={(e) => setStatusFilter(e.target.value)}
                     aria-label="Status"
                   >
-                    {STATUS_FILTERS.map((opt) => {
-                      const counts = buildStatusQtyCounts(baseAssets);
-                      return (
-                        <option key={opt.id} value={opt.id}>
-                          {opt.label} ({counts?.[opt.id] ?? 0})
-                        </option>
-                      );
-                    })}
+                    {STATUS_FILTERS.map((opt) => (
+                      <option key={opt.id} value={opt.id}>
+                        {opt.label} ({statusCounts?.[opt.id] ?? 0})
+                      </option>
+                    ))}
                   </select>
                 </div>
               </div>
@@ -2693,6 +2809,8 @@ function OverviewPage({ category }) {
           onOfficeIssue={setOfficeIssueTarget}
           onOfficeReturn={setOfficeReturnTarget}
           responsive
+          resetKey={`${category}|${categoryFilter}|${hwSubFilter}|${projectNameFilter}|${deferredSearchQuery}`}
+          serverList={serverActive ? server : null}
         />
       </InventoryPanel>
 

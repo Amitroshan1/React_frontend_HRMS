@@ -333,16 +333,26 @@ def verify_signature(rel: str, exp: str | int, sig: str) -> bool:
     return hmac.compare_digest(expected, (sig or "").strip())
 
 
-def build_signed_file_url(rel: str, ttl: Optional[int] = None) -> str:
+def build_signed_file_url(rel: str, ttl: Optional[int] = None, *, bucket: Optional[int] = None) -> str:
     """
     Relative URL usable in <img src> / <a href> without JWT header.
     Points at /api/files/signed/... so nginx can proxy API only.
+    `bucket` (seconds) overrides how long the same URL is reused; only for immutable files.
     """
     rel = normalize_upload_rel(rel)
     if not rel:
         return ""
-    ttl = ttl if ttl is not None else file_sign_ttl_seconds()
-    exp = int(time.time()) + int(ttl)
+    if ttl is not None:
+        exp = int(time.time()) + int(ttl)
+    else:
+        # Round expiry up to a bucket boundary so the same file yields the same URL for a few
+        # minutes: browsers can cache the image and identical API bodies can return 304.
+        # Validity is still at least the configured TTL (at most TTL + bucket).
+        ttl = file_sign_ttl_seconds()
+        if bucket is None:
+            bucket = min(300, max(60, ttl // 4))
+        bucket = max(60, int(bucket))
+        exp = (int(time.time()) // bucket + 1) * bucket + ttl
     sig, exp = make_signature(rel, exp)
     # Encode path segments but keep slashes
     encoded = "/".join(quote(p, safe="") for p in rel.split("/"))

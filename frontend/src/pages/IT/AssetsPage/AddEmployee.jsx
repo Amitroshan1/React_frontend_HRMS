@@ -20,6 +20,7 @@ import {
   toastITApiFailure,
   lookupEmployeeByEmpIdOrEmailAPI,
   syncITDataFromAPI,
+  IT_NAV_SYNC_MAX_AGE_MS,
   SEED_EMPLOYEES
 } from "../Data";
 import { useTransitionRemark } from "../itam/TransitionRemarkModal";
@@ -395,7 +396,7 @@ const AddEmployee = () => {
   const [unitsRefreshKey, setUnitsRefreshKey] = useState(0);
 
   const refreshAssignableUnits = useCallback(() => {
-    syncITDataFromAPI()
+    syncITDataFromAPI({ maxAgeMs: IT_NAV_SYNC_MAX_AGE_MS })
       .then(() => setUnitsRefreshKey((k) => k + 1))
       .catch((err) => {
         console.error("[AddEmployee] API sync failed, using cached units:", err);

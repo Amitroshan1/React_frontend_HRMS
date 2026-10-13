@@ -1,5 +1,6 @@
 import ClickableImage from "../../../components/ClickableImage";
 import { openFirstImageInNewTab } from "../../../utils/openImageInNewTab";
+import { isImageSrc } from "../../../utils/mediaSrc";
 import { compressImage } from "../Data";
 
 export const truncateFileName = (name, max = 22) => {
@@ -125,7 +126,7 @@ export function InventoryFileCell({
             onClick={() => {
               const items = buildPreviewItems(row, field);
               const firstImage = items.find(
-                (it) => it.isImage && String(it.data).startsWith("data:image/"),
+                (it) => it.isImage && isImageSrc(it.data),
               );
               if (firstImage?.data && openFirstImageInNewTab([firstImage.data])) return;
               onPreview(row.id, field);
@@ -154,7 +155,7 @@ export function FilePreviewModal({ items, title, onClose, onRemove }) {
           <div className="ana-photo-grid">
             {items.map((item, i) => (
               <div key={i} className="ana-photo-item">
-                {item.isImage && String(item.data).startsWith("data:image/") ? (
+                {item.isImage && isImageSrc(item.data) ? (
                   <ClickableImage src={item.data} alt={item.name || ""} />
                 ) : (
                   <div className="ana-file-preview-tag" title={item.name}>
@@ -177,7 +178,7 @@ export function FilePreviewModal({ items, title, onClose, onRemove }) {
 export function buildPreviewItems(dataUrls = [], names = []) {
   return (dataUrls || []).map((data, i) => {
     const name = names[i] || `File ${i + 1}`;
-    const isImage = String(data).startsWith("data:image/");
+    const isImage = isImageSrc(data);
     return { data, name, isImage };
   });
 }

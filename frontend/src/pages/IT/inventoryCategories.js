@@ -28,7 +28,7 @@ const CATEGORY_BY_KEY = Object.fromEntries(
 
 export const INVENTORY_CATEGORY_CONFIG = {
   "IT Assets": {
-    hwTypes: ["Laptop", "Mobile", "Desktop", "Tablet"],
+    hwTypes: ["Laptop", "Mobile", "Desktop", "Tablet", "Dashcam", "ODCP"],
     accessoryTypes: ["Mouse", "Keyboard", "Headset", "Monitor", "Charger", "Cable"],
     consumableTypes: ["Pen Drive", "Battery", "Toner", "SIM Card", "Cleaning Kit"],
     mobileTabletHwTypes: ["Mobile", "Tablet"],

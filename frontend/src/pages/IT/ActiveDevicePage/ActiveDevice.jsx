@@ -2,11 +2,14 @@ import { useState, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { useRefreshOnNavigate } from "../../../hooks/useRefreshOnNavigate";
+import { useIncrementalList } from "../../../hooks/useIncrementalList";
+import ShowMoreRows from "../../../components/ShowMoreRows";
 import {
   getEmployees,
   getAssetUnitsFromStorage,
   toastITApiFailure,
-  syncITDataFromAPI
+  syncITDataFromAPI,
+  IT_NAV_SYNC_MAX_AGE_MS,
 } from "../Data";
 import { UserAvatar } from "../../../components/UserAvatar";
 import { getUserPhotoUrl } from "../../../utils/userPhoto";
@@ -280,21 +283,30 @@ function AssignmentDetailModal({ asset, employee, onClose }) {
 }
 
 // ─── Build merged active-device list (localStorage only) ─────────────────────
-function resolveAssigneePhoto(employees, empId, assignedToObj) {
+/** First employee (list order) per upper-cased empId — same pick as `employees.find`. */
+function buildEmployeeByIdIndex(employees) {
+  const byId = new Map();
+  for (const e of employees) {
+    const key = String(e.empId || e.id || "").toUpperCase();
+    if (!byId.has(key)) byId.set(key, e);
+  }
+  return byId;
+}
+
+function resolveAssigneePhoto(employeesById, empId, assignedToObj) {
   if (assignedToObj && typeof assignedToObj === "object") {
     const fromObj = getUserPhotoUrl(assignedToObj);
     if (fromObj) return fromObj;
   }
   const key = String(empId || "").toUpperCase();
   if (!key || key === "—") return "";
-  const match = employees.find(
-    (e) => String(e.empId || e.id || "").toUpperCase() === key,
-  );
+  const match = employeesById.get(key);
   return match ? getUserPhotoUrl(match) : "";
 }
 
 function getMergedActiveDevices() {
   const employees = getEmployees() || [];
+  const employeesById = buildEmployeeByIdIndex(employees);
 
   // 1. Individual hardware units that have been assigned (via AddEmployee)
   const units = (getAssetUnitsFromStorage() || [])
@@ -352,7 +364,7 @@ function getMergedActiveDevices() {
         status: u.status || "Assigned",
         photos,
         assignedTo,
-        assigneePhoto: resolveAssigneePhoto(employees, empId, isObj ? u.assignedTo : null),
+        assigneePhoto: resolveAssigneePhoto(employeesById, empId, isObj ? u.assignedTo : null),
         assignedDate:
           u.assignedDate || u.repairDate || new Date().toISOString(),
         empId,
@@ -409,7 +421,7 @@ export default function ActiveDevice({ onBack }) {
   const [detailView, setDetailView] = useState(null);
 
   const syncDevices = useCallback(() => {
-    syncITDataFromAPI()
+    syncITDataFromAPI({ maxAgeMs: IT_NAV_SYNC_MAX_AGE_MS })
       .then(() => setRefreshKey((k) => k + 1))
       .catch((err) => {
         console.error("[ActiveDevice] API sync failed, using cached data:", err);
@@ -443,6 +455,8 @@ export default function ActiveDevice({ onBack }) {
     }
     return r;
   }, [allDevices, activeTab, searchQuery]);
+
+  const tableRows = useIncrementalList(filtered, `${activeTab}|${searchQuery}`);
 
   const handleSearch = () => setSearchQuery(search);
   const handleKeyDown = (e) => {
@@ -633,7 +647,7 @@ export default function ActiveDevice({ onBack }) {
                     </td>
                   </tr>
                 ) : (
-                  filtered.map((asset, i) => (
+                  tableRows.visible.map((asset, i) => (
                     <tr
                       key={(asset._unitId || asset.id) + i}
                       className={`asd-row ${
@@ -706,6 +720,7 @@ export default function ActiveDevice({ onBack }) {
                     </tr>
                   ))
                 )}
+                <ShowMoreRows list={tableRows} colSpan={tableColSpan} />
               </tbody>
             </table>
           </div>

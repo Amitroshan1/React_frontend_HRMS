@@ -419,7 +419,7 @@ def create_request(admin, *, hw_type=None, notes=None, items=None, expected_retu
         raise DailyCheckoutError("Add at least one device or accessory line")
     has_device = any(it.get("line_type") == "device" for it in normalized)
     if not has_device:
-        raise DailyCheckoutError("Add at least one device (Laptop, Mobile, Desktop, or Tablet)")
+        raise DailyCheckoutError(f"Add at least one device ({', '.join(DEFAULT_HW_TYPES)})")
     allowed = {t.lower() for t in (hardware_types() or list(DEFAULT_HW_TYPES))}
     for it in normalized:
         if it.get("line_type") != "device":
@@ -1092,8 +1092,10 @@ def hardware_types():
         .all()
     )
     found = list(DEFAULT_HW_TYPES)
+    seen = {t.lower() for t in found}
     for (hw,) in extra:
         name = (hw or "").strip()
-        if name and name not in found:
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
             found.append(name)
     return found

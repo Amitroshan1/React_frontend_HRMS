@@ -18,6 +18,7 @@ import {
 import ClickableImage from "../../components/ClickableImage";
 import { UserAvatar } from "../../components/UserAvatar";
 import { openFirstImageInNewTab } from "../../utils/openImageInNewTab";
+import { isImageSrc } from "../../utils/mediaSrc";
 import "./EmployeeAssetsDetails.css";
 import { formatDate, formatDateTimeDDMMYYYY } from "../../utils/dateFormat";
 import {
@@ -444,7 +445,7 @@ const ReturnRequestModal = ({ entry, onClose, onSubmit, submitting }) => {
             <div className="ea-rr-previews">
               {photos.map((src, i) => (
                 <div key={i} className="ea-rr-preview-wrap">
-                  {String(src).startsWith("data:image/") ? (
+                  {isImageSrc(src) ? (
                     <ClickableImage src={src} alt={`upload-${i + 1}`} className="ea-rr-preview" />
                   ) : (
                     <span className="ea-rr-file-tag">File {i + 1}</span>

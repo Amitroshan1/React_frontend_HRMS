@@ -21,3 +21,29 @@ def photo_url_for_admin(admin):
     if not admin:
         return ""
     return photo_url_for_admin_id(getattr(admin, "id", None))
+
+
+def photo_urls_for_admin_ids(admin_ids):
+    """Batch variant of photo_url_for_admin_id: {admin_id: url} using one query.
+
+    Admin ids without an Employee row or photo map to "" (same as the single lookup).
+    """
+    ids = {int(i) for i in (admin_ids or []) if i}
+    if not ids:
+        return {}
+    rows = (
+        Employee.query.with_entities(Employee.id, Employee.admin_id, Employee.photo_filename)
+        .filter(Employee.admin_id.in_(ids))
+        .order_by(Employee.id.asc())
+        .all()
+    )
+    out = {i: "" for i in ids}
+    seen = set()
+    for _emp_id, admin_id, photo_fn in rows:
+        # Match .first() semantics of the single lookup: first Employee row per admin wins.
+        if admin_id in seen:
+            continue
+        seen.add(admin_id)
+        fn = (photo_fn or "").strip()
+        out[int(admin_id)] = secure_public_url_for_upload(fn) if fn else ""
+    return out

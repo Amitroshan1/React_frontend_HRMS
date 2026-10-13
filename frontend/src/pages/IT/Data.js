@@ -987,12 +987,25 @@ export const compressImage = (file, _options = {}) =>
 
 const IT_API_BASE = "/api/it";
 
+/** Freshness window for navigation-triggered syncs (writes always refetch). */
+export const IT_NAV_SYNC_MAX_AGE_MS = 10_000;
+
+// Full-sync bookkeeping (see syncITDataFromAPI). Any IT write resets freshness.
+let _itSyncedAt = 0;
+let _itWriteSeq = 0;
+let _itSyncInFlight = null;
+let _itSyncQueued = null;
+
 const _tokenHeaders = () => {
   const token = localStorage.getItem("token");
   return token ? { Authorization: `Bearer ${token}` } : {};
 };
 
 async function _itFetch(path, { method = "GET", body, headers = {} } = {}) {
+  if (method !== "GET") {
+    _itWriteSeq += 1;
+    _itSyncedAt = 0;
+  }
   const res = await fetch(`${IT_API_BASE}${path}`, {
     method,
     headers: {
@@ -1001,6 +1014,25 @@ async function _itFetch(path, { method = "GET", body, headers = {} } = {}) {
       ...headers,
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.success === false) {
+    throw errorFromApiResponse(res, data);
+  }
+  return data;
+}
+
+/** One page of a server-paged IT list. Read-only, so it does not reset full-sync freshness. */
+export async function fetchITListPageAPI(path, params = {}, { signal } = {}) {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === "") continue;
+    qs.set(key, String(value));
+  }
+  const query = qs.toString();
+  const res = await fetch(`${IT_API_BASE}${path}${query ? `?${query}` : ""}`, {
+    headers: { "Content-Type": "application/json", ..._tokenHeaders() },
+    signal,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data?.success === false) {
@@ -1061,6 +1093,9 @@ const _toLocalInventory = (item) => {
     inventoryCategory: resolveInventoryCategory(row),
   };
 };
+
+/** API inventory item -> the shape stored in the local inventory cache. */
+export const toLocalInventoryItem = _toLocalInventory;
 
 const _toLocalUnit = (u) => ({
   id: u.id,
@@ -1179,7 +1214,41 @@ const _toLocalParcelExport = (r) => ({
   photos: r.photos || [],
 });
 
-export const syncITDataFromAPI = async () => {
+/**
+ * Pull all IT lists from the API into the local cache.
+ *
+ * - Concurrent calls share one network round-trip instead of each refetching everything.
+ * - `maxAgeMs` (for navigation/mount refreshes): skip the network if a sync finished
+ *   within that window and no IT write happened since.
+ * - Default (no options) always fetches fresh data — use after create/update/delete.
+ */
+export const syncITDataFromAPI = ({ maxAgeMs = 0 } = {}) => {
+  const fresh = maxAgeMs > 0 && _itSyncedAt > 0 && Date.now() - _itSyncedAt < maxAgeMs;
+  if (fresh) return Promise.resolve();
+
+  if (!_itSyncInFlight) {
+    _itSyncInFlight = _runITSync().finally(() => {
+      _itSyncInFlight = null;
+    });
+    return _itSyncInFlight;
+  }
+  // Read-only refresh: the in-flight sync is new enough.
+  if (maxAgeMs > 0) return _itSyncInFlight;
+  // Forced refresh after a write: the in-flight request may predate the write,
+  // so run exactly one more sync after it (shared by all callers waiting now).
+  if (!_itSyncQueued) {
+    _itSyncQueued = _itSyncInFlight
+      .catch(() => {})
+      .then(() => {
+        _itSyncQueued = null;
+        return syncITDataFromAPI();
+      });
+  }
+  return _itSyncQueued;
+};
+
+const _runITSync = async () => {
+  const writeSeqAtStart = _itWriteSeq;
   const results = await Promise.allSettled([
     _itFetch("/inventory/items"),
     _itFetch("/units"),
@@ -1271,6 +1340,8 @@ export const syncITDataFromAPI = async () => {
   notifyInventoryChange();
 
   if (coreFailure) throw coreFailure;
+  // Only mark fresh if no IT write started while this sync was running.
+  if (_itWriteSeq === writeSeqAtStart) _itSyncedAt = Date.now();
 };
 
 export const createInventoryItemAPI = async ({
